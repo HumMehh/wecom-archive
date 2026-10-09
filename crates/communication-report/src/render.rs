@@ -268,6 +268,10 @@ const COLUMNS: &[(&str, f64)] = &[
 /// Column that holds the conversation, its embedded thumbnails and the link
 /// to the row's media directory.
 const TRANSCRIPT_COLUMN: u16 = 4;
+/// Column index of 姓名, one of the two the row height is measured from.
+const NAME_COLUMN: usize = 0;
+/// Column index of 总结记录, the other one the row height is measured from.
+const SUMMARY_COLUMN: usize = 1;
 /// Column index of 要点摘录, which is written in green.
 const HIGHLIGHT_COLUMN: usize = 5;
 
@@ -299,6 +303,57 @@ const TEXT_LINE_PIXELS: f64 = 20.0;
 /// One wrapped line of conversation text that must stay readable below the
 /// pictures, so the cell never looks like it only holds pictures.
 const TRAILING_TEXT_LINES: f64 = 4.0;
+
+/// Width of one character in Excel column-width units: a CJK glyph takes two
+/// of them, everything else one. Column widths use those units, so this is what
+/// turns a string into a number of wrapped lines.
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| if is_wide(character) { 2 } else { 1 })
+        .sum()
+}
+
+fn is_wide(character: char) -> bool {
+    matches!(character as u32,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD)
+}
+
+/// How many wrapped lines a string needs in a column that many units wide.
+/// Explicit newlines start a new line, exactly as Excel renders them.
+fn wrapped_lines(text: &str, width: f64) -> usize {
+    if width <= 0.0 {
+        return 1;
+    }
+    text.lines()
+        .map(|line| (display_width(line) as f64 / width).ceil() as usize)
+        .sum::<usize>()
+        .max(1)
+}
+
+/// The height a row needs so the two columns the sheet is read for — 姓名 and
+/// 总结记录 — are fully visible.
+///
+/// Excel does not re-fit a wrapped cell when it opens a file, so a row left at
+/// the default height shows one line of the summary and hides the rest. The
+/// conversation column is deliberately not measured: it holds a whole month of
+/// messages and would push every row past the 409-point ceiling.
+pub(crate) fn text_row_height_points(row: &PersonMonthRow) -> f64 {
+    let lines = wrapped_lines(&row.name, COLUMNS[NAME_COLUMN].1)
+        .max(wrapped_lines(&row.summary, COLUMNS[SUMMARY_COLUMN].1))
+        .max(1);
+    (lines as f64 * TEXT_LINE_POINTS).clamp(TEXT_LINE_POINTS, MAX_ROW_HEIGHT_POINTS)
+}
 
 /// Where thumbnails start inside the 聊天记录 cell and how tall the row has to
 /// be.
@@ -689,9 +744,9 @@ fn write_sheet(worksheet: &mut Worksheet, rows: &[PersonMonthRow]) -> Result<u32
                 .map_err(workbook_error)?;
         }
 
-        // A row with media gets an explicit height: the blank lines that hold the
-        // pictures back would otherwise push the conversation out of a default
-        // 15-point row. Rows without media keep Excel's own auto-fit.
+        // A row with media needs the height the pictures were planned for: the
+        // blank lines that hold them back would otherwise push the conversation
+        // out of a default 15-point row.
         if !media_text.is_empty() {
             let mut y_offset = layout.text_height_pixels.round() as u32;
             for (section, file, image) in embeddable.iter().take(layout.shown) {
@@ -711,10 +766,18 @@ fn write_sheet(worksheet: &mut Worksheet, rows: &[PersonMonthRow]) -> Result<u32
                     .map_err(workbook_error)?;
                 y_offset += (fitted_height.ceil() as u32).max(1);
             }
-            worksheet
-                .set_row_height(excel_row, layout.row_height_points)
-                .map_err(workbook_error)?;
         }
+
+        // Every row is sized for 姓名 and 总结记录, the two columns the sheet is
+        // read for. A row with media keeps whichever height is taller.
+        let height = if media_text.is_empty() {
+            text_row_height_points(row)
+        } else {
+            layout.row_height_points.max(text_row_height_points(row))
+        };
+        worksheet
+            .set_row_height(excel_row, height)
+            .map_err(workbook_error)?;
 
         excel_row += 1;
     }
@@ -987,6 +1050,68 @@ mod tests {
         let layout = plan_media_layout(2, &small);
         assert_eq!(layout.shown, small.len());
         assert!(layout.row_height_points <= MAX_ROW_HEIGHT_POINTS);
+    }
+
+    /// Excel does not re-fit a wrapped cell when it opens a file, so a row left
+    /// at the default height cuts the summary off after one line. The height has
+    /// to be written for every row, measured from 姓名 and 总结记录.
+    #[test]
+    fn the_row_height_fits_the_name_and_the_summary() {
+        // A short name and a short summary: one line each.
+        let mut short = row("张三");
+        short.summary = "已确认上线时间".into();
+        assert_eq!(text_row_height_points(&short), TEXT_LINE_POINTS);
+
+        // 总结记录 is 60 units wide, so a CJK character costs two of them and a
+        // 120-character summary needs four lines.
+        let mut long = row("张三");
+        long.summary = "总结".repeat(60);
+        assert_eq!(wrapped_lines(&long.summary, COLUMNS[SUMMARY_COLUMN].1), 4);
+        assert_eq!(text_row_height_points(&long), 4.0 * TEXT_LINE_POINTS);
+
+        // An explicit newline always starts a new line, even a short one.
+        let mut lines = row("张三");
+        lines.summary = "第一段\n第二段\n第三段".into();
+        assert_eq!(text_row_height_points(&lines), 3.0 * TEXT_LINE_POINTS);
+
+        // A long name alone is enough to make the row taller.
+        let mut named = row(&"名".repeat(30));
+        named.summary = String::new();
+        assert!(text_row_height_points(&named) > TEXT_LINE_POINTS);
+
+        // Nothing can push a row past the Excel ceiling.
+        let mut huge = row("张三");
+        huge.summary = "总结".repeat(5_000);
+        assert_eq!(text_row_height_points(&huge), MAX_ROW_HEIGHT_POINTS);
+    }
+
+    /// The written file must carry that height, otherwise Excel shows a single
+    /// line of the summary however well the maths works out.
+    #[test]
+    fn every_saved_row_carries_its_height() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut tall = row("张三");
+        tall.summary = "总结".repeat(60);
+        let mut plain = row("李四");
+        plain.summary = "短".into();
+
+        let path = directory.path().join(WORKBOOK_NAME);
+        write_workbook(&path, &[tall, plain]).unwrap();
+        let archive = std::fs::read(&path).unwrap();
+        let sheet = String::from_utf8(zip_member(&archive, "xl/worksheets/sheet1.xml")).unwrap();
+
+        let rows: Vec<&str> = sheet.match_indices("<row r=\"").map(|(i, _)| {
+            let end = sheet[i..].find('>').map(|offset| i + offset).unwrap_or(sheet.len());
+            &sheet[i..end]
+        }).collect();
+        assert_eq!(rows.len(), 3, "got {sheet}");
+        // The tall row carries the height its summary needs, and the writer
+        // records it as a custom height so Excel does not re-fit it away.
+        assert!(rows[1].contains("ht=\"60\""), "4 lines at 15pt: {}", rows[1]);
+        assert!(rows[1].contains("customHeight=\"1\""), "got {}", rows[1]);
+        // A row that only needs the default height is left alone, which renders
+        // identically to an explicit ht="15".
+        assert!(!rows[2].contains("ht=\""), "no height needed: {}", rows[2]);
     }
 
     /// Media never gets a row of its own: the pictures are anchored inside the
