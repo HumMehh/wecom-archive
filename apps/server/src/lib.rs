@@ -742,6 +742,15 @@ struct ImportResponse {
     completed_at: String,
 }
 
+/// One conversation the model refused or could not reach, named so the operator
+/// can find the row and re-run just that customer.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryFailure {
+    name: String,
+    reason: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ArchiveSummaryResponse {
     #[serde(flatten)]
@@ -3840,8 +3849,15 @@ struct CommunicationReportResponse {
     /// How many conversations received an external model summary. Zero means
     /// summarization was off, unconfigured, or every call failed.
     summarized: usize,
+    /// How many conversations the model could not summarize. A run that partly
+    /// fails is the normal case for a long list of customers, so the caller has
+    /// to be able to tell "69 of 107" from "all 107".
+    summary_failed: usize,
     /// Why no summary appeared, when the caller asked for one. Absent on success.
     summary_issue: Option<String>,
+    /// The customers whose summary failed, with the reason, so a partly
+    /// successful run can be repaired instead of re-run from scratch.
+    summary_failures: Vec<SummaryFailure>,
     /// The names actually written into the sheet, so an operator can confirm the
     /// archive resolved the WeCom remarks they expect.
     conversation_names: Vec<String>,
@@ -3908,6 +3924,15 @@ fn next_report_directory(export_root: &Path) -> (String, PathBuf) {
         }
         suffix += 1;
     }
+}
+
+/// A one-line, log-safe reason a call failed: the transport status and the
+/// gateway's own wording, with the newlines curl adds collapsed away. The
+/// conversation itself never appears here, and the diagnostics layer trims the
+/// result, so a chatty response cannot flood the log.
+fn summarize_failure_reason(error: &str) -> String {
+    let collapsed = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("reason={}", collapsed.chars().take(300).collect::<String>())
 }
 
 /// Read one exported media file into a request part.
@@ -3988,6 +4013,12 @@ struct SummarySettingsRequest {
     /// `None` means the stored value stays untouched.
     #[serde(default)]
     attach_media: Option<bool>,
+    /// Attempts per call, including the first. `None` keeps the stored value.
+    #[serde(default)]
+    retry_attempts: Option<usize>,
+    /// Minimum gap between two calls in milliseconds. `None` keeps the stored value.
+    #[serde(default)]
+    request_interval_ms: Option<u64>,
     /// Plaintext key, supplied once and stored DPAPI-protected. Omit to keep
     /// whatever key is already stored.
     api_key: Option<String>,
@@ -4081,6 +4112,12 @@ async fn update_summary_settings(
     }
     if let Some(attach_media) = request.attach_media {
         stored.attach_media = attach_media;
+    }
+    if let Some(retry_attempts) = request.retry_attempts {
+        stored.retry_attempts = retry_attempts.clamp(1, 10);
+    }
+    if let Some(request_interval_ms) = request.request_interval_ms {
+        stored.request_interval_ms = request_interval_ms.min(10_000);
     }
     if let Some(api_key) = request.api_key.map(|value| value.trim().to_owned()) {
         stored.protected_api_key = if api_key.is_empty() {
@@ -4310,6 +4347,7 @@ async fn create_communication_report(
         // conversation leaves that cell blank instead of failing the export.
         let mut rows = report.rows;
         let mut summarized = 0usize;
+        let mut failures: Vec<SummaryFailure> = Vec::new();
         // 请求了总结却一列都没填上时，必须把原因带回界面；否则用户只看到空白，
         // 无从判断是没配置、地址不对还是模型报错。
         let mut summary_issue = match &active_summary {
@@ -4360,8 +4398,24 @@ async fn create_communication_report(
                 let mut results: Vec<(String, String)> = Vec::with_capacity(jobs.len());
                 let mut first_error: Option<String> = None;
                 for job in jobs {
-                    let Ok(transcript) = std::fs::read_to_string(&job.note) else {
-                        continue;
+                    // A note that cannot be read is a failure like any other:
+                    // silently skipping it leaves a blank cell with no cause.
+                    let transcript = match std::fs::read_to_string(&job.note) {
+                        Ok(transcript) => transcript,
+                        Err(error) => {
+                            // Only the error kind is logged: the path carries the
+                            // customer's name and does not belong in a log file.
+                            diagnostics::write("summary_failed", &format!("kind={}", error.kind()));
+                            let reason = format!("无法读取该会话的正文文件：{error}");
+                            if first_error.is_none() {
+                                first_error = Some(reason.clone());
+                            }
+                            failures.push(SummaryFailure {
+                                name: row.name.clone(),
+                                reason,
+                            });
+                            continue;
+                        }
                     };
                     match summary::summarize_with_media(
                         &settings,
@@ -4372,9 +4426,17 @@ async fn create_communication_report(
                     ) {
                         Ok(text) => results.push((job.heading, text)),
                         Err(error) => {
+                            // The gateway's own wording and the transport status:
+                            // it carries no message text, and the customer's name
+                            // stays out of the log.
+                            diagnostics::write("summary_failed", &summarize_failure_reason(&error));
                             if first_error.is_none() {
-                                first_error = Some(error);
+                                first_error = Some(error.clone());
                             }
+                            failures.push(SummaryFailure {
+                                name: row.name.clone(),
+                                reason: error,
+                            });
                         }
                     }
                 }
@@ -4416,7 +4478,9 @@ async fn create_communication_report(
             voice_with_audio,
             missing_media,
             summarized,
+            summary_failed: failures.len(),
             summary_issue,
+            summary_failures: failures,
             conversation_names: rows.iter().map(|row| row.name.clone()).collect(),
             notes: report
                 .notes

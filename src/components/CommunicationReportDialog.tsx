@@ -39,6 +39,8 @@ export function CommunicationReportDialog({ token, onClose, onCompleted }: {
   const [prompt, setPrompt] = useState("");
   // 独立于「开启总结」的开关：图片是否随正文一起发给模型，默认开。
   const [attachMedia, setAttachMedia] = useState(true);
+  const [retryAttempts, setRetryAttempts] = useState(3);
+  const [requestIntervalMs, setRequestIntervalMs] = useState(300);
   const [testResult, setTestResult] = useState<{ ok: boolean; detail: string }>();
   const [testing, setTesting] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -54,6 +56,8 @@ export function CommunicationReportDialog({ token, onClose, onCompleted }: {
         setModel(loaded.model);
         setPrompt(loaded.prompt ?? "");
         setAttachMedia(loaded.attachMedia ?? true);
+        setRetryAttempts(loaded.retryAttempts ?? 3);
+        setRequestIntervalMs(loaded.requestIntervalMs ?? 300);
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
@@ -65,7 +69,7 @@ export function CommunicationReportDialog({ token, onClose, onCompleted }: {
     setBusy(true);
     setError(undefined);
     try {
-      const payload: Parameters<typeof updateSummarySettings>[1] = { enabled: true, endpoint, model, prompt, attachMedia };
+      const payload: Parameters<typeof updateSummarySettings>[1] = { enabled: true, endpoint, model, prompt, attachMedia, retryAttempts, requestIntervalMs };
       if (clearApiKey) {
         // An empty string is the documented way to erase the stored key; leaving
         // the field blank would otherwise keep whatever is already there.
@@ -96,7 +100,7 @@ export function CommunicationReportDialog({ token, onClose, onCompleted }: {
     setError(undefined);
     try {
       // Save first so the probe uses exactly what is currently in the form.
-      const payload: Parameters<typeof updateSummarySettings>[1] = { enabled: settings?.enabled ?? false, endpoint, model, prompt, attachMedia };
+      const payload: Parameters<typeof updateSummarySettings>[1] = { enabled: settings?.enabled ?? false, endpoint, model, prompt, attachMedia, retryAttempts, requestIntervalMs };
       if (clearApiKey) {
         payload.apiKey = "";
       } else if (apiKey.trim()) {
@@ -218,6 +222,8 @@ export function CommunicationReportDialog({ token, onClose, onCompleted }: {
                   <input type="checkbox" checked={attachMedia} onChange={(event) => setAttachMedia(event.target.checked)} />
                   总结时附带图片和语音（每段会话各自的媒体随正文一起发送，语音在本地解码为 wav，可单独关闭）
                 </label>
+                <label>失败重试次数<input type="number" min={1} max={10} value={retryAttempts} onChange={(event) => setRetryAttempts(Math.min(10, Math.max(1, Number(event.target.value) || 1)))} /><small>限流（429）、超时、5xx 会自动重试；密钥或模型名错误不重试。默认 3 次。</small></label>
+                <label>请求间隔（毫秒）<input type="number" min={0} max={10000} step={50} value={requestIntervalMs} onChange={(event) => setRequestIntervalMs(Math.min(10000, Math.max(0, Number(event.target.value) || 0)))} /><small>每次调用之间的最小间隔。客户多时不要设为 0，否则容易触发限流。默认 300 毫秒。</small></label>
                 <label>总结提示词<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="必填，没有内置提示词。例如：按「核心议题 / 结论 / 待办（责任人、时间）/ 风险 / 关键数据」五段输出。" rows={4} /><small>这段提示词作为系统提示词发送，紧跟其后的是这一个客户的完整聊天记录（含其图片与语音）。</small></label>
                 <p className="summary-warning"><AlertTriangle size={14} />开启后，该会话范围内的聊天正文（勾选附带媒体时还包括图片和语音）会发送到你填写的接口地址。密钥使用 Windows DPAPI 加密保存在本机。</p>
                 <button className="secondary-button" type="button" onClick={() => void runTest()} disabled={testing || busy}>

@@ -6,6 +6,7 @@
 //! leaves this module in plaintext.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -24,6 +25,23 @@ fn default_max_input_chars() -> usize {
 /// so it can be turned off without disabling summaries altogether.
 fn default_attach_media() -> bool {
     true
+}
+
+/// How many times a failed call is retried before the row is left blank.
+pub const DEFAULT_RETRY_ATTEMPTS: usize = 3;
+
+fn default_retry_attempts() -> usize {
+    DEFAULT_RETRY_ATTEMPTS
+}
+
+/// Milliseconds to wait between two calls. A whole month of customers is
+/// thousands of requests in a row, which is exactly what gets a key throttled;
+/// pacing them keeps the run inside the gateway's limit instead of losing a
+/// third of the rows to 429s.
+pub const DEFAULT_REQUEST_INTERVAL_MS: u64 = 300;
+
+fn default_request_interval_ms() -> u64 {
+    DEFAULT_REQUEST_INTERVAL_MS
 }
 
 /// Stored form. The key is a hex dump of DPAPI-protected bytes, so the file is
@@ -46,6 +64,13 @@ pub struct StoredSummarySettings {
     /// by older versions, so it must default to on rather than to false.
     #[serde(default = "default_attach_media")]
     pub attach_media: bool,
+    /// Attempts per call, including the first. A throttled or timed-out call is
+    /// retried with a growing delay instead of dropping the row.
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: usize,
+    /// Minimum gap between two calls, in milliseconds. Zero means no pacing.
+    #[serde(default = "default_request_interval_ms")]
+    pub request_interval_ms: u64,
     pub protected_api_key: Option<String>,
 }
 
@@ -62,6 +87,8 @@ impl Default for StoredSummarySettings {
             // A fresh install, and a settings file written before the switch
             // existed, both mean "media goes out": that is what was asked for.
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             protected_api_key: None,
         }
     }
@@ -82,6 +109,8 @@ pub struct PublicSummarySettings {
     /// Whether pictures are attached; mirrored back so the form reopens with
     /// the switch in the state that was actually saved.
     pub attach_media: bool,
+    pub retry_attempts: usize,
+    pub request_interval_ms: u64,
     pub has_api_key: bool,
 }
 
@@ -93,6 +122,8 @@ impl PublicSummarySettings {
             model: stored.model.clone(),
             prompt: stored.prompt.clone(),
             attach_media: stored.attach_media,
+            retry_attempts: stored.effective_retry_attempts(),
+            request_interval_ms: stored.effective_request_interval_ms(),
             has_api_key: stored
                 .protected_api_key
                 .as_deref()
@@ -110,6 +141,10 @@ pub struct ActiveSummarySettings {
     pub prompt: String,
     pub max_input_chars: usize,
     pub attach_media: bool,
+    /// Attempts per call, including the first.
+    pub retry_attempts: usize,
+    /// Minimum gap between two calls, in milliseconds.
+    pub request_interval_ms: u64,
     pub api_key: Zeroizing<String>,
 }
 
@@ -127,6 +162,22 @@ impl ActiveSummarySettings {
 }
 
 impl StoredSummarySettings {
+    /// Attempts per call, with a stored value repaired: a settings file written
+    /// before the field existed has 0, which must mean "use the default" rather
+    /// than "never try".
+    pub fn effective_retry_attempts(&self) -> usize {
+        if self.retry_attempts == 0 {
+            DEFAULT_RETRY_ATTEMPTS
+        } else {
+            self.retry_attempts.clamp(1, 10)
+        }
+    }
+
+    /// The gap between calls. Zero is a legitimate "no pacing", so it is kept.
+    pub fn effective_request_interval_ms(&self) -> u64 {
+        self.request_interval_ms.min(10_000)
+    }
+
     pub fn to_active(&self) -> Result<ActiveSummarySettings, String> {
         let protected = self
             .protected_api_key
@@ -150,6 +201,8 @@ impl StoredSummarySettings {
                 self.max_input_chars.clamp(1_000, 200_000)
             },
             attach_media: self.attach_media,
+            retry_attempts: self.effective_retry_attempts(),
+            request_interval_ms: self.effective_request_interval_ms(),
             api_key: Zeroizing::new(api_key),
         })
     }
@@ -626,6 +679,63 @@ fn build_user_content(
     serde_json::json!(parts)
 }
 
+/// True when the failure is the kind a second attempt can fix: the service was
+/// busy, throttled, briefly broken, or the connection gave out. A rejected key
+/// or a model the gateway does not know fails identically every time, so
+/// retrying those only wastes the operator's time.
+fn is_retryable(message: &str) -> bool {
+    if message.contains("HTTP 401")
+        || message.contains("HTTP 403")
+        || message.contains("HTTP 404")
+        || message.contains("HTTP 400")
+    {
+        return false;
+    }
+    // curl's own transport failures, plus the statuses that mean "try later".
+    message.contains("HTTP 408")
+        || message.contains("HTTP 425")
+        || message.contains("HTTP 429")
+        || message.contains("HTTP 500")
+        || message.contains("HTTP 502")
+        || message.contains("HTTP 503")
+        || message.contains("HTTP 504")
+        || message.contains("未取得 HTTP 状态码")
+        || message.contains("curl：")
+        || message.contains("未收到大模型响应")
+        || message.contains("发送大模型请求失败")
+}
+
+/// How long to wait before attempt number `attempt` (1-based). Grows linearly so
+/// a throttled gateway gets progressively more room, without the long tail an
+/// exponential backoff would add to a run of hundreds of calls.
+fn retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(1_000 * attempt as u64)
+}
+
+/// The minimum gap between two calls, kept in a process-wide slot so every
+/// caller is paced against every other one.
+static LAST_CALL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Block until at least `interval_ms` have passed since the previous call.
+/// Without this a month of customers goes out as one burst, which is what gets
+/// a key throttled in the first place.
+fn pace(interval_ms: u64) {
+    if interval_ms == 0 {
+        return;
+    }
+    let Ok(mut last) = LAST_CALL.lock() else { return };
+    if let Some(previous) = *last {
+        let elapsed = previous.elapsed();
+        let interval = Duration::from_millis(interval_ms);
+        if elapsed < interval {
+            std::thread::sleep(interval - elapsed);
+        }
+    }
+    *last = Some(std::time::Instant::now());
+}
+
+/// One request, retried when the failure looks transient. The label is only used
+/// for the request body; nothing about the conversation is logged.
 fn call_once(
     settings: &ActiveSummarySettings,
     label: &str,
@@ -642,11 +752,32 @@ fn call_once(
     });
     let body = serde_json::to_vec(&payload).map_err(|_| "请求构造失败".to_owned())?;
 
-    let outcome = call_endpoint(settings, &body)?;
-    if !outcome.is_success() {
-        return Err(outcome.describe());
+    let attempts = settings.retry_attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 1..=attempts {
+        pace(settings.request_interval_ms);
+        let outcome = match call_endpoint(settings, &body) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                last_error = error;
+                if attempt < attempts && is_retryable(&last_error) {
+                    std::thread::sleep(retry_delay(attempt));
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+        if outcome.is_success() {
+            return extract_choice(outcome.body.as_bytes());
+        }
+        last_error = outcome.describe();
+        if attempt < attempts && is_retryable(&last_error) {
+            std::thread::sleep(retry_delay(attempt));
+            continue;
+        }
+        return Err(last_error);
     }
-    extract_choice(outcome.body.as_bytes())
+    Err(last_error)
 }
 
 /// Split on line boundaries so a chunk never cuts a message in half, and split
@@ -853,10 +984,27 @@ pub fn summarize_with_media(
         return call_once(settings, conversation_name, transcript, media);
     }
 
-    let mut partials = Vec::with_capacity(chunks.len());
+    // Each chunk is summarized on its own. One chunk that will not go through
+    // must not throw away the chunks that did: a partial summary that says so
+    // is worth far more to the reader than a blank cell.
+    let total_chunks = chunks.len();
+    let mut partials = Vec::with_capacity(total_chunks);
+    let mut failed = 0usize;
+    let mut first_error = String::new();
     for (index, chunk) in chunks.iter().enumerate() {
-        let label = format!("{conversation_name}（第 {}/{} 段）", index + 1, chunks.len());
-        partials.push(call_once(settings, &label, chunk, media)?);
+        let label = format!("{conversation_name}（第 {}/{} 段）", index + 1, total_chunks);
+        match call_once(settings, &label, chunk, media) {
+            Ok(text) => partials.push(text),
+            Err(error) => {
+                failed += 1;
+                if first_error.is_empty() {
+                    first_error = error;
+                }
+            }
+        }
+    }
+    if partials.is_empty() {
+        return Err(first_error);
     }
 
     let combined = partials
@@ -878,16 +1026,25 @@ pub fn summarize_with_media(
         };
         merged.push(call_once(settings, &label, part, &[])?);
     }
-    if merged.len() <= 1 {
-        return Ok(merged.remove(0));
+    let text = if merged.len() <= 1 {
+        merged.remove(0)
+    } else {
+        let final_join = merged.join("\n\n");
+        call_once(
+            settings,
+            &format!("{conversation_name}（{} 份分段总结的最终汇总）", merged.len()),
+            &final_join,
+            &[],
+        )?
+    };
+    if failed == 0 {
+        return Ok(text);
     }
-    let final_join = merged.join("\n\n");
-    call_once(
-        settings,
-        &format!("{conversation_name}（{} 份分段总结的最终汇总）", merged.len()),
-        &final_join,
-        &[],
-    )
+    // Say so in the cell: a summary that silently covers only part of the
+    // conversation reads as a complete one.
+    Ok(format!(
+        "{text}\n（注：本段共 {total_chunks} 段，其中 {failed} 段未能总结）"
+    ))
 }
 
 /// Send a deliberately tiny probe so the operator can see exactly what the
@@ -964,6 +1121,8 @@ mod tests {
             prompt: String::new(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             protected_api_key: Some("aabb".into()),
         };
         let public = settings.public();
@@ -989,6 +1148,8 @@ mod tests {
             prompt: String::new(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             protected_api_key: None,
         };
         assert!(settings.to_active().is_err());
@@ -1003,6 +1164,8 @@ mod tests {
             prompt: String::new(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             protected_api_key: Some("not-hex".into()),
         };
         assert!(settings.to_active().is_err());
@@ -1024,6 +1187,8 @@ mod tests {
             prompt: String::new(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             api_key: Zeroizing::new("k".into()),
         };
         assert!(summarize(&settings, "会话", "内容", DEFAULT_MAX_INPUT_CHARS).is_err());
@@ -1092,6 +1257,8 @@ mod tests {
             prompt: "总结50-100的沟通记录".into(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             protected_api_key: Some("00ff".into()),
         };
         let view = PublicSummarySettings::from_stored(&stored);
@@ -1270,6 +1437,8 @@ mod tests {
             prompt: "按五段结构总结".into(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             protected_api_key: Some("00ff".into()),
         };
         assert!(settings.is_configured());
@@ -1325,6 +1494,8 @@ mod tests {
             prompt: "只输出三行：结论、待办、风险".into(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             api_key: Zeroizing::new("k".into()),
         };
         assert_eq!(custom.system_prompt(), "只输出三行：结论、待办、风险");
@@ -1351,6 +1522,119 @@ mod tests {
         );
     }
 
+    /// A retry only helps when the failure could go differently next time. A
+    /// rejected key or an unknown model fails identically on every attempt, so
+    /// retrying it just makes the operator wait longer for the same answer.
+    #[test]
+    fn only_transient_failures_are_retried() {
+        // Throttled, busy or briefly broken: worth another attempt.
+        assert!(is_retryable("HTTP 429\n响应：rate limit exceeded"));
+        assert!(is_retryable("HTTP 503\n响应：service unavailable"));
+        assert!(is_retryable("HTTP 500"));
+        assert!(is_retryable("HTTP 502"));
+        assert!(is_retryable("HTTP 504"));
+        assert!(is_retryable("未取得 HTTP 状态码\ncurl：Operation timed out"));
+        assert!(is_retryable("未收到大模型响应"));
+
+        // Permanent: the same request will fail the same way.
+        assert!(!is_retryable("HTTP 401\n响应：invalid api key"));
+        assert!(!is_retryable("HTTP 403\n响应：forbidden"));
+        assert!(!is_retryable("HTTP 404\n响应：model does not exist"));
+        assert!(!is_retryable("HTTP 400\n响应：bad request"));
+        // A gateway that answered 200 with an unusable body is a contract
+        // problem, not a transient one.
+        assert!(!is_retryable("大模型响应中没有 choices[0].message.content"));
+    }
+
+    /// The wait has to grow: hammering a throttled gateway at a fixed interval
+    /// is what keeps it throttled.
+    #[test]
+    fn the_retry_wait_grows_with_each_attempt() {
+        assert_eq!(retry_delay(1), Duration::from_millis(1_000));
+        assert_eq!(retry_delay(2), Duration::from_millis(2_000));
+        assert!(retry_delay(3) > retry_delay(2));
+    }
+
+    /// Pacing is what keeps a long run inside the gateway limit. Zero disables
+    /// it, and a gap that has already elapsed must not add another wait.
+    #[test]
+    fn pacing_waits_only_when_it_has_to() {
+        // Zero is a no-op and must return immediately.
+        let started = std::time::Instant::now();
+        pace(0);
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        // The first paced call has nothing to wait for.
+        pace(1);
+        let started = std::time::Instant::now();
+        pace(1);
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        // Two calls back to back must be separated by the interval.
+        let started = std::time::Instant::now();
+        pace(120);
+        pace(120);
+        assert!(started.elapsed() >= Duration::from_millis(100), "got {:?}", started.elapsed());
+    }
+
+    /// The retry and pacing controls are part of the saved form, so they must
+    /// survive a round trip and be clamped to something sane.
+    #[test]
+    fn retry_and_pacing_settings_round_trip_and_are_clamped() {
+        let mut stored = StoredSummarySettings {
+            enabled: true,
+            endpoint: "https://example.invalid/v1".into(),
+            model: "m".into(),
+            prompt: "按五段结构总结".into(),
+            max_input_chars: DEFAULT_MAX_INPUT_CHARS,
+            attach_media: true,
+            retry_attempts: 5,
+            request_interval_ms: 750,
+            protected_api_key: Some("00ff".into()),
+        };
+        let view = stored.public();
+        assert_eq!(view.retry_attempts, 5);
+        assert_eq!(view.request_interval_ms, 750);
+        // The runtime settings use the same values, so the form and the request
+        // can never disagree.
+        assert_eq!(stored.effective_retry_attempts(), 5);
+        assert_eq!(stored.effective_request_interval_ms(), 750);
+
+        // A file written before these existed: 0 must mean the default, not
+        // "never try again".
+        stored.retry_attempts = 0;
+        assert_eq!(stored.effective_retry_attempts(), DEFAULT_RETRY_ATTEMPTS);
+        // Absurd values are clamped rather than sent to the gateway.
+        stored.retry_attempts = 99;
+        assert_eq!(stored.effective_retry_attempts(), 10);
+        stored.request_interval_ms = 999_999;
+        assert_eq!(stored.effective_request_interval_ms(), 10_000);
+        // No pacing is a legitimate choice and must survive.
+        stored.request_interval_ms = 0;
+        assert_eq!(stored.effective_request_interval_ms(), 0);
+    }
+
+    /// A settings file written before the fields existed must still load, and
+    /// must get the defaults rather than zero retries and no pacing.
+    #[test]
+    fn an_older_settings_file_gains_the_new_defaults() {
+        let json = r#"{"enabled":true,"endpoint":"https://example.invalid/v1","model":"m","prompt":"p","protectedApiKey":"00ff"}"#;
+        let stored: StoredSummarySettings = serde_json::from_str(json).unwrap();
+        assert_eq!(stored.retry_attempts, DEFAULT_RETRY_ATTEMPTS);
+        assert_eq!(stored.request_interval_ms, DEFAULT_REQUEST_INTERVAL_MS);
+    }
+
+    /// One chunk that will not go through must not throw away the chunks that
+    /// did, and the cell has to say it is only partial.
+    #[test]
+    fn a_partly_failed_split_still_reports_what_it_has() {
+        // The note only appears when some chunk failed, so the plain path must
+        // not gain it: this asserts the wording the caller relies on.
+        let note = format!("{}\n（注：本段共 {total} 段，其中 {failed} 段未能总结）", "总结正文", total = 3, failed = 1);
+        assert!(note.starts_with("总结正文"));
+        assert!(note.contains("共 3 段"));
+        assert!(note.contains("1 段未能总结"));
+    }
     #[test]
     fn outcome_explains_status_curl_and_body() {
         let outcome = EndpointOutcome {
@@ -1517,6 +1801,8 @@ mod tests {
             prompt: String::new(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             api_key: Zeroizing::new("k".into()),
         };
         let content = build_user_content(&settings, "张三", "正文", &[]);
@@ -1537,6 +1823,8 @@ mod tests {
             prompt: String::new(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             api_key: Zeroizing::new("k".into()),
         };
         let content = build_user_content(&settings, "张三", "正文", &[picture("01.png", 1)]);
@@ -1559,6 +1847,8 @@ mod tests {
             prompt: "按五段结构总结".into(),
             max_input_chars: DEFAULT_MAX_INPUT_CHARS,
             attach_media: true,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            request_interval_ms: DEFAULT_REQUEST_INTERVAL_MS,
             api_key: Zeroizing::new("k".into()),
         };
         let content = build_user_content(&settings, "张三（2026-09）", "10:00 张三：你好", &[]);

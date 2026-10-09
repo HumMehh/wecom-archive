@@ -573,6 +573,10 @@ export interface CommunicationReportResult {
   voiceWithAudio: number;
   missingMedia: number;
   summarized: number;
+  /** Conversations the model could not summarize. */
+  summaryFailed: number;
+  /** Which customers failed and why, when a run partly succeeded. */
+  summaryFailures?: { name: string; reason: string }[];
   /** Why no summary appeared, when one was requested. */
   summaryIssue?: string;
   /** Names as written into the sheet, for verifying the resolved WeCom remarks. */
@@ -601,6 +605,10 @@ export interface SummarySettings {
   prompt: string;
   /** Whether pictures (and model-supported voices) go out with the transcript. */
   attachMedia: boolean;
+  /** Attempts per call, including the first. */
+  retryAttempts: number;
+  /** Minimum gap between two calls, in milliseconds. */
+  requestIntervalMs: number;
 }
 
 export interface SummarySettingsUpdate {
@@ -610,6 +618,10 @@ export interface SummarySettingsUpdate {
   prompt?: string;
   /** Omit to keep the stored switch; pass a value to change it. */
   attachMedia?: boolean;
+  /** Omit to keep the stored value. */
+  retryAttempts?: number;
+  /** Omit to keep the stored value. */
+  requestIntervalMs?: number;
   /** Omit to keep the stored key, or pass an empty string to clear it. */
   apiKey?: string;
 }
