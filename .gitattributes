@@ -1,0 +1,8 @@
+# Keep the repository LF-only. core.autocrlf is true on Windows, which would
+# otherwise rewrite every source file to CRLF on checkout and turn the next
+# edit into a whole-file diff.
+* text=auto eol=lf
+
+# Files git must never normalise or diff as text.
+*.png binary
+*.ico binary
