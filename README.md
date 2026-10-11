@@ -13,6 +13,10 @@
 - 导出 JSON、CSV、HTML 或 Markdown 单文件，默认启用数据脱敏、简化信息和美化信息；阅读型 JSON、HTML 和 Markdown 按会话分组，CSV 按会话连续输出；关闭美化时输出紧凑格式。
 - 简化导出保留会话、发送人、时间、消息类型、正文和附件名称，移除系统 ID、原始数据和群目录。简化 JSON 仅供阅读，完整 JSON 可重新导入。
 - 媒体按内容哈希流式采集，图片可预览，文件通过 Windows 默认应用打开；不生成 ZIP 或校验旁车文件。
+- 语音消息与图片、文件走同一条媒体通道，原始音频会随采集落盘并可导出；不做语音转写。
+- 在状态栏点击“沟通记录”，按「**姓名 + 月份**」导出：一人一月一行，列为姓名、时间（如 `2026-09-01 ~ 2026-09-30`）、消息数、**聊天记录**、要点摘录、总结记录。**聊天记录不依赖大模型**，直接把该月全部记录写进单元格，超过 Excel 上限时自动截断并提示，完整内容始终在同目录的 Markdown 里。默认只统计个人会话（可取消勾选以包含群聊）。
+- 「姓名」取的是**对方**在企业微信里的显示名，也就是解析出的备注，而不是把双方拼在一起：归档用消息方向区分本机和对方，发出的消息属于本机，于是另一侧就是这一行的姓名。同一个人在同一个月里的多个会话会合并成一行。导出完成后会在提示里列出实际写入的姓名，便于核对。
+- 沟通记录的“总结”列默认留空，可手工填写；如需自动生成，可在同一弹窗里配置自有大模型接口（地址、模型、密钥）。该功能默认关闭，开启后选中范围的聊天正文会发送到所填地址，详见 [`docs/privacy-security.md`](docs/privacy-security.md)。
 
 `WeComArchive.exe` 在同一进程内运行桌面窗口、本机归档服务和服务端生成的采集端运行时，默认监听 `127.0.0.1:9812`。窗口可隐藏并按计划后台运行；退出程序会停止服务和任务。生成的采集端使用服务端预置的绑定身份和签名配置，并按心跳同步后续修改。
 
@@ -37,6 +41,7 @@ crates/parser/        消息归一化
 crates/transfer/      采集传输与数据脱敏
 crates/archive-store/ SQLite/FTS5 归档、修订和审计
 crates/export/        JSON/CSV/HTML/Markdown 导出
+crates/communication-report/ 沟通记录 Excel/Markdown 生成与要点提取
 ```
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。

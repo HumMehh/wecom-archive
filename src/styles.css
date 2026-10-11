@@ -379,6 +379,20 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .export-date-range label { display: grid; gap: 6px; color: #66758a; font-size: 10px; }
 .export-date-range input { height: 34px; padding: 0 8px; border: 1px solid #ccd6e3; border-radius: 5px; color: #24364f; background: #fff; font-size: 11px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.footer-action { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border: 1px solid rgba(255,255,255,.28); border-radius: 5px; color: inherit; background: transparent; font-size: 11px; cursor: pointer; }
+.footer-action:hover { background: rgba(255,255,255,.12); }
+.summary-status { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 11px; }
+.summary-settings { display: grid; gap: 9px; margin-top: 10px; }
+.summary-settings textarea { min-height: 84px; padding: 8px; border: 1px solid #ccd6e3; border-radius: 5px; color: #24364f; background: #fff; font-family: inherit; font-size: 11px; line-height: 1.6; resize: vertical; }
+.summary-status.ok { color: #0c8f5a; white-space: pre-wrap; }
+.summary-status.bad { color: #8b3035; white-space: pre-wrap; }
+.summary-settings label { display: grid; gap: 5px; color: #66758a; font-size: 10px; }
+.summary-settings input { height: 34px; padding: 0 8px; border: 1px solid #ccd6e3; border-radius: 5px; color: #24364f; background: #fff; font-size: 11px; }
+.summary-settings label:has(input[type="password"]) { gap: 7px; }
+.summary-settings .inline-check { display: flex; align-items: center; gap: 6px; color: #8a5a00; font-size: 10px; }
+.summary-settings .inline-check input { height: auto; }
+.summary-warning { display: flex; align-items: flex-start; gap: 6px; margin: 2px 0 0; color: #8a5a00; font-size: 10px; line-height: 1.6; }
+.summary-warning > svg { flex: none; margin-top: 1px; }
 .toast { position: fixed; z-index: 50; top: 18px; left: 50%; transform: translateX(-50%); min-width: 340px; max-width: calc(100vw - 32px); padding: 11px 13px; display: flex; align-items: center; gap: 9px; color: #fff; border-radius: 7px; background: #172b48; box-shadow: 0 12px 30px rgba(17,31,53,.28); font-size: 12px; }
 .toast > svg { flex: none; color: #63d59e; }.toast span { flex: 1; white-space: pre-line; }.toast button { border: 0; color: #fff; cursor: pointer; }.toast-action { flex: none; padding: 6px 9px; border-radius: 5px; background: #2f68bd; font-size: 11px; font-weight: 650; }.toast-action:hover { background: #3977d0; }.toast-close { flex: none; display: grid; place-items: center; padding: 3px; background: transparent; }
 .toast.error { background: #8b3035; box-shadow: 0 12px 30px rgba(91, 25, 30, .28); }.toast.error > svg { color: #ffd2d4; }

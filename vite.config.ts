@@ -42,6 +42,10 @@ export default defineConfig(({ mode }) => {
       setupFiles: ["./src/test/setup.ts"],
       globals: true,
       css: true,
+      // jsdom setup dominates this suite (11 environments, ~30s), which pushes
+      // the slower component tests past the 5s default and makes the run flaky
+      // under parallel load rather than because of a real regression.
+      testTimeout: 20000,
     },
   };
 });

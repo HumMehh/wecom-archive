@@ -547,3 +547,95 @@ export function createLocalExport(token: string, payload: LocalExportRequest): P
 export function openExportDirectory(token: string): Promise<{ opened: boolean }> {
   return request<{ opened: boolean }>("/api/v1/exports/open-directory", token, { method: "POST" });
 }
+
+export interface CommunicationReportRequest {
+  conversationIds?: string[];
+  startDate?: string;
+  endDate?: string;
+  /** `YYYY-MM`. Takes precedence over the date range when both are given. */
+  month?: string;
+  utcOffsetHours?: number;
+  /** Keep only one-to-one conversations and drop group chats. */
+  onlyDirect?: boolean;
+  /** Keep only people WeCom itself lists as external contacts (customers). */
+  onlyExternal?: boolean;
+  /** Ask the configured external model to fill the summary column. */
+  summarize?: boolean;
+  dataRedaction?: boolean;
+}
+
+export interface CommunicationReportResult {
+  directory: string;
+  workbook: string;
+  conversationCount: number;
+  messageCount: number;
+  voiceCount: number;
+  voiceWithAudio: number;
+  missingMedia: number;
+  summarized: number;
+  /** Why no summary appeared, when one was requested. */
+  summaryIssue?: string;
+  /** Names as written into the sheet, for verifying the resolved WeCom remarks. */
+  conversationNames: string[];
+  notes: string[];
+}
+
+export function createCommunicationReport(
+  token: string,
+  payload: CommunicationReportRequest,
+): Promise<CommunicationReportResult> {
+  return request<CommunicationReportResult>("/api/v1/exports/communication", token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Everything except the key itself; the server never sends it back. */
+export interface SummarySettings {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  hasApiKey: boolean;
+  /** Custom summary instructions; empty means the built-in prompt. */
+  prompt: string;
+  /** Whether pictures (and model-supported voices) go out with the transcript. */
+  attachMedia: boolean;
+}
+
+export interface SummarySettingsUpdate {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  prompt?: string;
+  /** Omit to keep the stored switch; pass a value to change it. */
+  attachMedia?: boolean;
+  /** Omit to keep the stored key, or pass an empty string to clear it. */
+  apiKey?: string;
+}
+
+export interface SummaryTestResult {
+  ok: boolean;
+  /** Human-readable diagnosis, including HTTP status and the service's reply. */
+  detail: string;
+}
+
+export function getSummarySettings(token: string): Promise<SummarySettings> {
+  return request<SummarySettings>("/api/v1/summary/settings", token);
+}
+
+export function updateSummarySettings(
+  token: string,
+  payload: SummarySettingsUpdate,
+): Promise<SummarySettings> {
+  return request<SummarySettings>("/api/v1/summary/settings", token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Probe the stored endpoint with a tiny request; carries no archived content. */
+export function testSummaryEndpoint(token: string): Promise<SummaryTestResult> {
+  return request<SummaryTestResult>("/api/v1/summary/test", token, { method: "POST" });
+}

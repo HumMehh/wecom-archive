@@ -259,7 +259,8 @@ describe("archive workspace", () => {
     fireEvent.blur(screen.getByLabelText("跳转页码"));
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("offset") === "200" && new URL(url, "http://localhost").searchParams.get("limit") === "100")).toBe(true));
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 3 页"))).toBeInTheDocument();
-  });
+    // 这条用例要驱动三次分页渲染，jsdom 下接近默认 5s 上限，并行时容易假失败。
+  }, 20000);
 
   it("can collapse and expand the conversation detail panel", async () => {
     installApiMock();

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { LoaderCircle, ShieldCheck } from "lucide-react";
+import { FileSpreadsheet, LoaderCircle, ShieldCheck } from "lucide-react";
 import { ConversationList } from "./components/ConversationList";
+import { CommunicationReportDialog } from "./components/CommunicationReportDialog";
 import { DetailPanel } from "./components/DetailPanel";
 import { LocalExportPage } from "./components/LocalExportPage";
 import { MessageTimeline } from "./components/MessageTimeline";
@@ -81,6 +82,7 @@ export default function App() {
   const [exportConversationOrder, setExportConversationOrder] = useState<ExportOrder>("descending");
   const [exportMessageOrder, setExportMessageOrder] = useState<ExportOrder>("descending");
   const [showExport, setShowExport] = useState(false);
+  const [showCommunicationReport, setShowCommunicationReport] = useState(false);
   const [detailCollapsed, setDetailCollapsed] = useState(false);
   const [messageStatus, setMessageStatus] = useState("等待选择会话");
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error"; actionLabel?: string; onAction?: () => void }>();
@@ -361,9 +363,10 @@ export default function App() {
         {superAdminEnabled && selectedConversation.isGroup && <DetailPanel conversation={selectedConversation} participants={participants} messages={messages} collapsed={detailCollapsed} onToggleCollapsed={() => setDetailCollapsed((current) => !current)} />}
       </>}
     </div>
-    <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
+    <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span>{superAdminEnabled && <button className="footer-action" type="button" onClick={() => setShowCommunicationReport(true)}><FileSpreadsheet size={14} />沟通记录</button>}<span><i />受控访问 · 审计已启用</span></footer>
      {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
     {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
+    {showCommunicationReport && superAdminEnabled && <CommunicationReportDialog token={token} onClose={() => setShowCommunicationReport(false)} onCompleted={(result) => { setShowCommunicationReport(false); const preview = result.conversationNames.slice(0, 8).join("、"); const more = result.conversationNames.length > 8 ? ` 等 ${result.conversationNames.length} 人` : ""; const summarized = result.summarized > 0 ? `，已自动总结 ${result.summarized} 行` : ""; const issue = result.summaryIssue ? `\n总结未生效：${result.summaryIssue}` : ""; setToast({ message: `沟通记录已生成：${result.workbook}，${result.conversationCount} 行（姓名 × 月份）、${result.messageCount.toLocaleString("zh-CN")} 条消息${summarized}。\n姓名：${preview}${more}${issue}`, tone: result.summaryIssue ? "error" : "success", actionLabel: "打开导出目录", onAction: () => void openExportDirectory(token).catch((error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })) }); }} />}
     {customRootIssue && !collectingLocal && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(root) => { void collectLocal(customRootIssue.includeMedia, root); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}
     {toast && <Toast tone={toast.tone} actionLabel={toast.actionLabel} onAction={toast.onAction} onClose={() => setToast(undefined)}>{toast.message}</Toast>}

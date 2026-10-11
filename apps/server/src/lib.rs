@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{Local, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,7 +37,9 @@ use zeroize::Zeroizing;
 
 static EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
 
+mod audio;
 mod diagnostics;
+mod summary;
 
 fn next_export_file(export_root: &Path, extension: &str) -> (String, PathBuf) {
     loop {
@@ -1188,6 +1190,15 @@ fn prepare_server(
             post(create_local_export).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
+            "/api/v1/exports/communication",
+            post(create_communication_report).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/v1/summary/settings",
+            get(get_summary_settings).post(update_summary_settings),
+        )
+        .route("/api/v1/summary/test", post(test_summary_endpoint))
+        .route(
             "/api/v1/exports/open-directory",
             post(open_export_directory),
         )
@@ -1821,13 +1832,9 @@ fn normalize_upload_url(value: &str) -> Result<String, ApiError> {
 /// cause the desktop service to bind broadly without an explicit override.
 fn configured_private_listen_address(upload_url: &str) -> Option<SocketAddr> {
     let trimmed = upload_url.trim();
-    let authority = if let Some(value) = trimmed.strip_prefix("http://") {
-        value
-    } else if let Some(value) = trimmed.strip_prefix("https://") {
-        value
-    } else {
-        return None;
-    };
+    let authority = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))?;
     let authority = authority.split(['/', '?', '#']).next()?.trim();
     let authority = authority.rsplit('@').next()?.trim();
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
@@ -2410,12 +2417,12 @@ async fn collector_heartbeat(
         if let Some(last_success) = request.last_success_at {
             collector.last_upload_at = Some(last_success);
         }
-        if let Some(completed_id) = request.last_manual_collection_request_id {
-            if collector.manual_collection_request_id.as_deref() == Some(completed_id.as_str()) {
-                collector.last_manual_collection_request_id = Some(completed_id);
-                collector.manual_collection_request_id = None;
-                collector.config_revision = collector.config_revision.saturating_add(1);
-            }
+        if let Some(completed_id) = request.last_manual_collection_request_id
+            && collector.manual_collection_request_id.as_deref() == Some(completed_id.as_str())
+        {
+            collector.last_manual_collection_request_id = Some(completed_id);
+            collector.manual_collection_request_id = None;
+            collector.config_revision = collector.config_revision.saturating_add(1);
         }
         collector.clone()
     };
@@ -3154,10 +3161,10 @@ async fn run_local_collection_scheduler(state: AppState) {
             let should_reset = next_runs
                 .get(&plan.id)
                 .is_none_or(|(schedule, _)| schedule != &plan.schedule);
-            if should_reset {
-                if let Some(next) = plan.schedule.next_after(now) {
-                    next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
-                }
+            if should_reset
+                && let Some(next) = plan.schedule.next_after(now)
+            {
+                next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
             }
         }
         for plan in plans {
@@ -3633,10 +3640,10 @@ async fn create_export_job(
     if request.scope == ExportScope::DateRange && starts_at.is_none() && ends_at.is_none() {
         return Err(ApiError::invalid_query());
     }
-    if let (Some(start), Some(end)) = (starts_at, ends_at) {
-        if start >= end {
-            return Err(ApiError::invalid_query());
-        }
+    if let (Some(start), Some(end)) = (starts_at, ends_at)
+        && start >= end
+    {
+        return Err(ApiError::invalid_query());
     }
     let base_query = MessageQuery {
         conversation_id: None,
@@ -3791,6 +3798,636 @@ async fn create_export_job(
         missing_media_count: result.1.missing_media_count,
         manifest_sha256: result.1.manifest_sha256,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommunicationReportRequest {
+    #[serde(default)]
+    conversation_ids: Vec<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    /// `YYYY-MM`. Takes precedence over the date range when both are given.
+    month: Option<String>,
+    /// Local offset from UTC in hours; defaults to 8.
+    #[serde(default)]
+    utc_offset_hours: Option<i32>,
+    /// Keep only one-to-one conversations and drop group chats.
+    #[serde(default)]
+    only_direct: bool,
+    /// Keep only conversations whose other side WeCom lists as an external
+    /// contact, dropping colleagues and service accounts.
+    #[serde(default)]
+    only_external: bool,
+    /// Ask the configured external model to fill the summary column. Ignored
+    /// unless an operator has enabled and configured summarization.
+    #[serde(default)]
+    summarize: bool,
+    #[serde(default)]
+    data_redaction: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommunicationReportResponse {
+    directory: String,
+    workbook: String,
+    conversation_count: usize,
+    message_count: usize,
+    voice_count: usize,
+    voice_with_audio: usize,
+    missing_media: usize,
+    /// How many conversations received an external model summary. Zero means
+    /// summarization was off, unconfigured, or every call failed.
+    summarized: usize,
+    /// Why no summary appeared, when the caller asked for one. Absent on success.
+    summary_issue: Option<String>,
+    /// The names actually written into the sheet, so an operator can confirm the
+    /// archive resolved the WeCom remarks they expect.
+    conversation_names: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn parse_report_month(
+    value: Option<&str>,
+) -> Result<Option<communication_report::LocalMonth>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = chrono::NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
+        .map_err(|_| ApiError::invalid_query())?;
+    Ok(Some((
+        parsed.format("%Y").to_string().parse().unwrap_or(1970),
+        parsed.month(),
+    )))
+}
+
+/// Fall back to the archive's conversation id convention when the stored label
+/// is absent. `S:` marks a direct chat and `R:` a group, matching the naming
+/// used when the archive was written.
+fn derive_conversation_type(conversation_id: &str) -> Option<String> {
+    if conversation_id.starts_with("S:") {
+        Some("direct".into())
+    } else if conversation_id.starts_with("R:") {
+        Some("group".into())
+    } else {
+        None
+    }
+}
+
+/// The participant on the other side of a direct conversation. Outgoing
+/// messages identify the archive owner, so whoever is not the owner is the
+/// person the conversation is about.
+fn counterpart_participant_id(
+    messages: &[communication_report::ReportMessage],
+) -> Option<String> {
+    let owner_recorded = messages.iter().any(communication_report::ReportMessage::is_from_owner);
+    messages
+        .iter()
+        .find(|message| {
+            !message.is_from_owner()
+                && (owner_recorded || message.direction != archive_domain::MessageDirection::System)
+        })
+        .and_then(|message| message.sender_id.clone())
+}
+
+/// Every report gets its own timestamped directory so a second export never
+/// overwrites the first.
+fn next_report_directory(export_root: &Path) -> (String, PathBuf) {
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut suffix = 0;
+    loop {
+        let name = if suffix == 0 {
+            format!("communication-{stamp}")
+        } else {
+            format!("communication-{stamp}-{suffix}")
+        };
+        let target = export_root.join(&name);
+        if !target.exists() {
+            return (name, target);
+        }
+        suffix += 1;
+    }
+}
+
+/// Read one exported media file into a request part.
+///
+/// Spreadsheets and documents are never uploaded: the summary needs pictures
+/// and voices, and the transcript already names every other file by path. A SILK
+/// voice is decoded to wav first, because that is the only form a chat gateway
+/// accepts as audio; if the decode fails the original bytes travel instead, so
+/// the request still names the file rather than dropping it in silence.
+fn summary_media_part(
+    file: &communication_report::RowMediaFile,
+) -> Option<summary::MediaPart> {
+    let extension = file
+        .relative
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let (kind, mime) = match file.kind {
+        communication_report::MediaKind::Image => {
+            let mime = match extension.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "bmp" => "image/bmp",
+                "webp" => "image/webp",
+                _ => return None,
+            };
+            (summary::MediaKind::Image, mime)
+        }
+        communication_report::MediaKind::Voice => {
+            let mime = match extension.as_str() {
+                "wav" => "audio/wav",
+                "mp3" => "audio/mpeg",
+                "silk" => "audio/silk",
+                "amr" => "audio/amr",
+                "m4a" => "audio/mp4",
+                "ogg" => "audio/ogg",
+                _ => "application/octet-stream",
+            };
+            (summary::MediaKind::Voice, mime)
+        }
+        communication_report::MediaKind::File => return None,
+    };
+    let bytes = std::fs::read(&file.absolute).ok()?;
+    let (mime, bytes) = match (file.kind, extension.as_str()) {
+        (communication_report::MediaKind::Voice, "silk") => match audio::silk_to_wav(&bytes) {
+            Ok(wav) => ("audio/wav".to_owned(), wav),
+            Err(reason) => {
+                // Only the container is logged: the export path carries the
+                // conversation name, which does not belong in a log file.
+                diagnostics::verbose("summary-voice-decode-failed", &reason);
+                (mime.to_owned(), bytes)
+            }
+        },
+        _ => (mime.to_owned(), bytes),
+    };
+    Some(summary::MediaPart {
+        kind,
+        mime,
+        label: file.label.clone(),
+        bytes,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SummarySettingsRequest {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    model: String,
+    /// Custom summary instructions; empty restores the built-in prompt.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Whether pictures (and model-supported voices) travel with the transcript.
+    /// `None` means the stored value stays untouched.
+    #[serde(default)]
+    attach_media: Option<bool>,
+    /// Plaintext key, supplied once and stored DPAPI-protected. Omit to keep
+    /// whatever key is already stored.
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryTestResponse {
+    ok: bool,
+    detail: String,
+}
+
+/// Send a tiny probe to the stored endpoint and report exactly what came back,
+/// so a misconfigured address or key is visible instead of a blank column.
+async fn test_summary_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SummaryTestResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
+    let data_root = Arc::clone(&state.data_root);
+    let result = tokio::task::spawn_blocking(move || {
+        let stored = summary::load(&summary::settings_path(&data_root));
+        // The probe deliberately ignores the enabled switch: it carries no
+        // archived content and the operator asked for it on purpose, so a
+        // complete form must be testable before「保存并开启」arms the switch.
+        if !stored.is_configured() {
+            return SummaryTestResponse {
+                ok: false,
+                detail: "尚未配置完成：需要同时填写接口地址、模型名称、总结提示词和 API 密钥。"
+                    .to_owned(),
+            };
+        }
+        match stored.to_active() {
+            Err(error) => SummaryTestResponse {
+                ok: false,
+                detail: format!("密钥读取失败：{error}"),
+            },
+            Ok(settings) => match summary::diagnose(&settings) {
+                Ok(detail) => SummaryTestResponse { ok: true, detail },
+                Err(detail) => SummaryTestResponse { ok: false, detail },
+            },
+        }
+    })
+    .await
+    .map_err(|_| ApiError::store())?;
+    Ok(Json(result))
+}
+
+async fn get_summary_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<summary::PublicSummarySettings>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
+    let data_root = Arc::clone(&state.data_root);
+    let stored = summary::load(&summary::settings_path(&data_root));
+    Ok(Json(stored.public()))
+}
+
+async fn update_summary_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SummarySettingsRequest>,
+) -> Result<Json<summary::PublicSummarySettings>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
+    let data_root = Arc::clone(&state.data_root);
+    let path = summary::settings_path(&data_root);
+    let mut stored = summary::load(&path);
+
+    // Refuse to arm the switch until everything a real request needs is set,
+    // so "enabled" can never be a lie in the UI.
+    if request.enabled && (request.endpoint.trim().is_empty() || request.model.trim().is_empty()) {
+        return Err(ApiError::invalid_settings(
+            "开启总结前，请先填写接口地址和模型名称。",
+        ));
+    }
+    stored.enabled = request.enabled;
+    stored.endpoint = request.endpoint.trim().to_owned();
+    stored.model = request.model.trim().to_owned();
+    if let Some(prompt) = request.prompt {
+        stored.prompt = prompt.trim().to_owned();
+    }
+    // There is no built-in prompt any more: it is the whole system message, so
+    // an install without one has nothing to send.
+    if stored.enabled && stored.prompt.trim().is_empty() {
+        return Err(ApiError::invalid_settings(
+            "开启总结前，请先填写总结提示词（没有内置提示词）。",
+        ));
+    }
+    if let Some(attach_media) = request.attach_media {
+        stored.attach_media = attach_media;
+    }
+    if let Some(api_key) = request.api_key.map(|value| value.trim().to_owned()) {
+        stored.protected_api_key = if api_key.is_empty() {
+            None
+        } else {
+            Some(summary::protect_key(&api_key).map_err(|_| ApiError::store())?)
+        };
+    }
+    if stored.enabled && !stored.is_usable() {
+        return Err(ApiError::invalid_settings(
+            "开启总结前，请先填写 API 密钥（已保存的密钥会被视为已填写）。",
+        ));
+    }
+    summary::save(&path, &stored).map_err(|_| ApiError::store())?;
+    Ok(Json(stored.public()))
+}
+
+/// Build a per-conversation workbook plus one Markdown transcript per
+/// conversation. Summary cells stay blank so a caller can fill them afterwards.
+async fn create_communication_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CommunicationReportRequest>,
+) -> Result<Json<CommunicationReportResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
+    let month = parse_report_month(request.month.as_deref())?;
+    let starts_at = parse_export_date(request.start_date.as_deref(), false)?;
+    let ends_at = parse_export_date(request.end_date.as_deref(), true)?;
+    if let (Some(start), Some(end)) = (starts_at, ends_at)
+        && start >= end
+    {
+        return Err(ApiError::invalid_query());
+    }
+    let conversation_ids = request
+        .conversation_ids
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let base_query = MessageQuery {
+        conversation_id: None,
+        participant_id: None,
+        text: None,
+        starts_at,
+        ends_at: ends_at.map(|value| value - TimeDelta::nanoseconds(1)),
+        message_type: None,
+        media_only: false,
+        limit: 50_000,
+        offset: 0,
+        sort_ascending: true,
+    };
+    let options = communication_report::ReportOptions {
+        month,
+        utc_offset_minutes: request
+            .utc_offset_hours
+            .unwrap_or(8)
+            .clamp(-12, 14)
+            .saturating_mul(60),
+        include_media: true,
+        only_direct: request.only_direct,
+    };
+    let data_redaction = request.data_redaction;
+    let only_external = request.only_external;
+    let summarize_requested = request.summarize;
+    let archive_path = Arc::clone(&state.archive_path);
+    let data_root = Arc::clone(&state.data_root);
+    let export_directory = data_root.join("exports").display().to_string();
+
+    // Resolve the optional model configuration before the blocking section so
+    // an unconfigured switch fails closed instead of silently doing nothing.
+    let active_summary = if request.summarize {
+        let stored = summary::load(&summary::settings_path(&data_root));
+        if stored.is_usable() {
+            stored.to_active().ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let response = tokio::task::spawn_blocking(move || {
+        let store = ArchiveStore::open_read_only(&archive_path).map_err(ApiError::from_store)?;
+        let mut messages = if conversation_ids.is_empty() {
+            query_all_messages(&store, base_query).map_err(ApiError::from_store)?
+        } else {
+            let mut combined = Vec::new();
+            for conversation_id in &conversation_ids {
+                let mut query = base_query.clone();
+                query.conversation_id = Some(conversation_id.clone());
+                combined.extend(query_all_messages(&store, query).map_err(ApiError::from_store)?);
+            }
+            combined.sort_by(|left, right| {
+                left.sent_at
+                    .cmp(&right.sent_at)
+                    .then_with(|| left.stable_message_id.cmp(&right.stable_message_id))
+            });
+            combined
+        };
+        if data_redaction {
+            redact_sensitive_messages(&mut messages);
+        }
+        let message_count = messages.len();
+
+        let in_scope = messages
+            .iter()
+            .map(|message| message.conversation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut directory = std::collections::BTreeMap::new();
+        let mut external_participants = std::collections::BTreeSet::new();
+        for id in &in_scope {
+            for participant in store
+                .list_conversation_participants(id)
+                .map_err(ApiError::from_store)?
+            {
+                // WeCom marks external contacts at collection time, so a report
+                // can tell a customer from a same-named colleague.
+                if participant.participant_kind.as_deref() == Some("external") {
+                    external_participants.insert(participant.participant_id.clone());
+                }
+                directory.insert(participant.participant_id.clone(), participant.display_name);
+            }
+        }
+        // The archive already resolved display names at ingest time, preferring
+        // the WeCom remark. Keep the participant names and the conversation type
+        // as fallbacks so a direct chat shows a person instead of a raw id.
+        let mut conversation_display: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        let mut conversation_participants: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut conversation_types: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        let mut offset = 0;
+        let mut remaining = in_scope.clone();
+        while !remaining.is_empty() {
+            let page = store
+                .list_conversations(200, offset)
+                .map_err(ApiError::from_store)?;
+            if page.is_empty() {
+                break;
+            }
+            offset += page.len() as u64;
+            for conversation in page {
+                if !remaining.remove(conversation.conversation_id.as_str()) {
+                    continue;
+                }
+                let id = conversation.conversation_id;
+                conversation_display.insert(id.clone(), conversation.display_name);
+                conversation_participants.insert(id.clone(), conversation.participant_names);
+                conversation_types.insert(id, conversation.conversation_type);
+            }
+        }
+
+        let mut grouped: Vec<communication_report::ReportConversation> = in_scope
+            .iter()
+            .map(|id| {
+                let participants = conversation_participants.get(id).cloned().unwrap_or_default();
+                let named: Vec<String> = participants
+                    .iter()
+                    .filter(|name| !name.trim().is_empty())
+                    .cloned()
+                    .collect();
+                let name = conversation_display
+                    .get(id)
+                    .cloned()
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| (!named.is_empty()).then(|| named.join("、")))
+                    .unwrap_or_else(|| id.clone());
+                communication_report::ReportConversation {
+                    conversation_id: id.clone(),
+                    name,
+                    conversation_type: conversation_types
+                        .get(id)
+                        .cloned()
+                        .flatten()
+                        .or_else(|| derive_conversation_type(id)),
+                    messages: Vec::new(),
+                }
+            })
+            .collect();
+        // Own the keys so `grouped` stays mutable while messages are appended.
+        let positions: std::collections::BTreeMap<String, usize> = grouped
+            .iter()
+            .enumerate()
+            .map(|(index, conversation)| (conversation.conversation_id.clone(), index))
+            .collect();
+        for message in messages {
+            let Some(position) = positions.get(message.conversation_id.as_str()) else {
+                continue;
+            };
+            let sender_name = message
+                .sender_id
+                .as_ref()
+                .and_then(|id| directory.get(id).cloned())
+                .flatten();
+            grouped[*position].messages.push(communication_report::ReportMessage {
+                sent_at: message.sent_at,
+                sender_name,
+                sender_id: message.sender_id.clone(),
+                // Outgoing identifies the archive owner, which is how the report
+                // tells the owner apart from the person a row is about.
+                direction: message.direction.clone(),
+                message_type: message.message_type.clone(),
+                body_text: message.body_text.clone(),
+                media: message.media.clone(),
+            });
+        }
+
+        // 客户过滤放在最后：消息全部归组之后才知道每段会话的对方是谁。
+        if only_external {
+            grouped.retain(|conversation| {
+                counterpart_participant_id(&conversation.messages)
+                    .is_some_and(|id| external_participants.contains(&id))
+            });
+        }
+
+        let export_root = data_root.join("exports");
+        let (file_name, target) = next_report_directory(&export_root);
+        let media_root = data_root.join("media");
+        let report =
+            communication_report::generate(&target, &grouped, Some(media_root.as_path()), options)
+                .map_err(ApiError::from_communication_report)?;
+
+        // Fill the summary column conversation by conversation. A failure on one
+        // conversation leaves that cell blank instead of failing the export.
+        let mut rows = report.rows;
+        let mut summarized = 0usize;
+        // 请求了总结却一列都没填上时，必须把原因带回界面；否则用户只看到空白，
+        // 无从判断是没配置、地址不对还是模型报错。
+        let mut summary_issue = match &active_summary {
+            Some(_) => None,
+            None if summarize_requested => Some(
+                "尚未配置可用的大模型接口，总结请求已忽略；请在弹窗里填写地址、模型、总结提示词和密钥并开启。"
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        if let Some(settings) = active_summary {
+            for index in 0..report.notes.len() {
+                let Some(row) = rows.get(index) else {
+                    break;
+                };
+                let key = row.key.clone();
+                let label_base = format!("{}（{}）", row.name, row.period);
+
+                // 一段会话一次独立请求：只带这段会话自己的 transcript 和自己的
+                // 图片/语音，请求之间不共享任何历史。多段会话因此互不可见——
+                // A 的聊天内容永远到不了 B 的那次调用里。
+                struct Job {
+                    heading: String,
+                    note: std::path::PathBuf,
+                    media: Vec<summary::MediaPart>,
+                }
+                let jobs: Vec<Job> = if row.sections.is_empty() {
+                    vec![Job {
+                        heading: label_base.clone(),
+                        note: report.notes[index].clone(),
+                        media: Vec::new(),
+                    }]
+                } else {
+                    row.sections
+                        .iter()
+                        .map(|section| Job {
+                            heading: format!("{} · {}", section.conversation, label_base),
+                            note: section.note.clone(),
+                            media: section
+                                .media
+                                .iter()
+                                .filter_map(summary_media_part)
+                                .collect(),
+                        })
+                        .collect()
+                };
+
+                let mut results: Vec<(String, String)> = Vec::with_capacity(jobs.len());
+                let mut first_error: Option<String> = None;
+                for job in jobs {
+                    let Ok(transcript) = std::fs::read_to_string(&job.note) else {
+                        continue;
+                    };
+                    match summary::summarize_with_media(
+                        &settings,
+                        &job.heading,
+                        &transcript,
+                        &job.media,
+                        settings.max_input_chars,
+                    ) {
+                        Ok(text) => results.push((job.heading, text)),
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+
+                if results.is_empty() {
+                    if let Some(error) = first_error
+                        && summary_issue.is_none()
+                    {
+                        summary_issue = Some(error);
+                    }
+                    continue;
+                }
+                // 一段时直接用；多段时按会话标注来源，谁的结论写在谁名下。
+                let combined = if results.len() == 1 {
+                    results.pop().expect("one result").1
+                } else {
+                    results
+                        .iter()
+                        .map(|(heading, text)| format!("【{heading}】\n{text}"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+
+                if communication_report::apply_summary(&target, &key, &combined, &mut rows).is_ok() {
+                    summarized += 1;
+                }
+            }
+        }
+
+        let voice_count = rows.iter().map(|row| row.audio_count).sum::<usize>();
+        let voice_with_audio = rows.iter().map(|row| row.voice_with_audio).sum::<usize>();
+        let missing_media = rows.iter().map(|row| row.missing_media).sum::<usize>();
+        Ok::<_, ApiError>(CommunicationReportResponse {
+            directory: export_directory,
+            workbook: file_name,
+            conversation_count: rows.len(),
+            message_count,
+            voice_count,
+            voice_with_audio,
+            missing_media,
+            summarized,
+            summary_issue,
+            conversation_names: rows.iter().map(|row| row.name.clone()).collect(),
+            notes: report
+                .notes
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        })
+    })
+    .await
+    .map_err(|_| ApiError::store())??;
+    Ok(Json(response))
 }
 
 /// Export the current local WeCom snapshot directly. This keeps the fast
@@ -4324,6 +4961,20 @@ impl ApiError {
         }
     }
 
+    /// The caller's own settings form is incomplete. Naming the missing field
+    /// beats the generic query error, which reads like a failed search when it
+    /// is really a form that is not finished yet.
+    fn invalid_settings(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            body: ErrorResponse {
+                code: "INVALID_SUMMARY_SETTINGS",
+                message: message.into(),
+                recoverable: true,
+            },
+        }
+    }
+
     fn local_collection_unavailable() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -4412,6 +5063,20 @@ impl ApiError {
             body: ErrorResponse {
                 code: "ARCHIVE_EXPORT_FAILED",
                 message: "服务端导出失败；未完成文件已清理。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
+    /// Discard the underlying error: it can name conversation titles and other
+    /// private material, so it must not reach the client or the logs.
+    fn from_communication_report(error: communication_report::ReportError) -> Self {
+        let _ = error;
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: ErrorResponse {
+                code: "COMMUNICATION_REPORT_FAILED",
+                message: "沟通记录导出失败；未完成文件已清理。".into(),
                 recoverable: true,
             },
         }

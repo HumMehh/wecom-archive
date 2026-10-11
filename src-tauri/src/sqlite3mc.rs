@@ -249,14 +249,14 @@ fn wal_checksum(endian: ChecksumEndian, bytes: &[u8], initial: (u32, u32)) -> (u
     debug_assert!(bytes.len() >= 8 && bytes.len().is_multiple_of(8));
     let mut first = initial.0;
     let mut second = initial.1;
-    for words in bytes.chunks_exact(8) {
+    for word in bytes.as_chunks::<8>().0 {
         let left = match endian {
-            ChecksumEndian::Little => u32::from_le_bytes(words[..4].try_into().unwrap()),
-            ChecksumEndian::Big => u32::from_be_bytes(words[..4].try_into().unwrap()),
+            ChecksumEndian::Little => u32::from_le_bytes(word[..4].try_into().unwrap()),
+            ChecksumEndian::Big => u32::from_be_bytes(word[..4].try_into().unwrap()),
         };
         let right = match endian {
-            ChecksumEndian::Little => u32::from_le_bytes(words[4..].try_into().unwrap()),
-            ChecksumEndian::Big => u32::from_be_bytes(words[4..].try_into().unwrap()),
+            ChecksumEndian::Little => u32::from_le_bytes(word[4..].try_into().unwrap()),
+            ChecksumEndian::Big => u32::from_be_bytes(word[4..].try_into().unwrap()),
         };
         first = first.wrapping_add(left).wrapping_add(second);
         second = second.wrapping_add(right).wrapping_add(first);

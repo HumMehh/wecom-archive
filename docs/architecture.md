@@ -42,6 +42,14 @@ React 只能调用白名单 Tauri commands。Windows API 和源数据适配集�
 
 工作台按当前会话、当前筛选或全部档案导出单个 JSON、CSV、HTML 或 Markdown 文件。阅读型 JSON、HTML 和 Markdown 以会话为分组，CSV 保持同一会话连续并带会话字段；本机完整 JSON 仍保留可导入契约，同时附加会话消息视图。导出使用 `.partial` 原子完成并拒绝覆盖已有文件；CSV 防公式注入，HTML 全量转义并禁止脚本和远程资源，Markdown 对结构字符及 HTML 标签进行转义。
 
+## 沟通记录
+
+`crates/communication-report` 不含 Windows API 和网络访问，只接受已归档的会话与消息，产出目录内的 Excel 汇总表、每人一月的 Markdown 全文，以及从内容寻址媒体库复制出的图片和语音原文件。
+
+汇总表按「姓名 × 月份」分桶，而不是按会话。归档在采集时已按消息方向区分本机与对方（`MessageDirection::Outgoing` 即本机发出），因此一个单聊会话里非本机的那一侧就是这一行的姓名，用的正是采集阶段解析出的企业微信备注。同一个人在同一个月里的多个会话合并为一行；跨月则拆成多行，每行的时间列是该自然月的真实首末日。会话名在写入前被规整为单个安全路径组件，媒体哈希必须是 64 位十六进制，工作簿经 `.partial` 原子落盘。要点摘录是无模型的抽取式启发式：高频中文 2–4 gram 加上命中「截止/确认/上线/交付/风险/负责」等信号的句子。
+
+服务端在 `POST /api/v1/exports/communication` 组装输入。总结列默认留空；若管理员在 `POST /api/v1/summary/settings` 配置并开启了外部接口，导出时会把每份 Markdown 交给该接口取回总结，再重写工作簿。密钥经 DPAPI 保护，出站请求复用既有的 `curl.exe` 子进程方式，边界见 [`privacy-security.md`](privacy-security.md)。
+
 ## 版本化契约
 
 `MessageV1`、`ArchiveBatchV1`、`ClientExportV1` 和 `UploadEnvelopeV1` 保持字段语义兼容。采集传输继续使用 `enterprise-package.v1` 作为既有协议版本名，解密后进入 `ClientExportV1` 校验链路；该内部名称不代表独立产品版本。

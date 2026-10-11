@@ -8,6 +8,7 @@ members = [
   "crates/export",
   "crates/transfer",
   "crates/source-windows",
+  "crates/communication-report",
   "apps/server",
   "src-tauri",
 ]
@@ -26,6 +27,7 @@ message-parser = { path = "crates/parser" }
 media-store = { path = "crates/media-store" }
 archive-export = { path = "crates/export" }
 archive-transfer = { path = "crates/transfer" }
+communication-report = { path = "crates/communication-report" }
 source-windows = { path = "crates/source-windows" }
 
 axum = "=0.8.9"
@@ -35,9 +37,11 @@ futures-util = "=0.3.34"
 hex = "=0.4.3"
 rusqlite = { version = "=0.40.2", features = ["bundled", "chrono", "functions", "serde_json", "uuid", "vtab"] }
 libsqlite3-sys = "=0.38.2"
+rust_xlsxwriter = "=0.99.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
+silk-decoder-rs = "=0.1.0"
 tauri = "=2.11.5"
 tauri-build = "=2.6.3"
 tempfile = "=3.27.0"

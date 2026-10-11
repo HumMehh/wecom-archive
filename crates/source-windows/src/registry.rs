@@ -70,9 +70,11 @@ fn read_registry_string(name: &str, view: u32) -> Option<String> {
     if !matches!(kind, REG_SZ | REG_EXPAND_SZ) || bytes.len() % 2 != 0 {
         return None;
     }
-    let units = bytes
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    // The length check above guarantees an even length, so there is no remainder.
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .take_while(|unit| *unit != 0)
         .collect::<Vec<_>>();
     String::from_utf16(&units).ok()

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(windows)]
@@ -212,6 +212,13 @@ struct CollectionAuthorization {
 struct MediaCollectionOptions {
     include_files: bool,
     include_images: bool,
+    include_voice: bool,
+}
+
+impl MediaCollectionOptions {
+    fn collects_any_media(&self) -> bool {
+        self.include_files || self.include_images || self.include_voice
+    }
 }
 
 struct MediaResolver {
@@ -227,7 +234,7 @@ impl MediaResolver {
             .filter_map(|root| root.canonicalize().ok())
             .collect::<Vec<_>>();
         let mut files_by_key = BTreeMap::new();
-        if options.include_files || options.include_images {
+        if options.collects_any_media() {
             for root in &roots {
                 index_media_directory(root, root, 0, &mut files_by_key);
             }
@@ -640,6 +647,9 @@ async fn collect_source(
         let media_options = MediaCollectionOptions {
             include_files: config.include_files,
             include_images: config.include_images,
+            // Voice rides along with the existing merged media switch so the
+            // signed collector configuration keeps its exact field list.
+            include_voice: config.include_files || config.include_images,
         };
         let encrypted = candidate
             .databases
@@ -771,6 +781,7 @@ fn collect_local_export_internal(
             MediaCollectionOptions {
                 include_files: include_media,
                 include_images: include_media,
+                include_voice: include_media,
             },
             media_sink,
             Some(&progress),
@@ -1937,6 +1948,9 @@ fn collect_candidate_with_options(
     )
 }
 
+// The collection pipeline's options are deliberately flat: grouping them into a
+// struct would only move the same fields between call sites.
+#[allow(clippy::too_many_arguments)]
 fn collect_candidate_with_options_since(
     candidate: SourceCandidate,
     work_root: PathBuf,
@@ -1992,6 +2006,7 @@ fn collect_candidate_with_options_since(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_snapshot_export_with_options(
     candidate: &SourceCandidate,
     receipt: &archive_domain::SnapshotReceipt,
@@ -2314,7 +2329,11 @@ fn read_snapshot_export_with_options(
     messages.retain(|message| match message.message_type {
         MessageType::Image => media_options.include_images,
         MessageType::File => media_options.include_files,
-        MessageType::Audio | MessageType::Video => false,
+        // Voice messages always stay in the archive: the fact that a voice was
+        // sent is part of the conversation record. Whether the audio bytes come
+        // along is decided by resolve_media_metadata_with_options, which marks
+        // the media reference missing when voice collection is switched off.
+        MessageType::Video => false,
         _ => true,
     });
     messages.sort_by(|left, right| {
@@ -2417,23 +2436,31 @@ fn read_snapshot_export_with_options(
         .collect::<Vec<_>>();
     let participants = participant_ids
         .into_iter()
-        .map(|participant_id| ParticipantV1 {
-            display_name: display_names
-                .participants
-                .get(&participant_id)
-                .cloned()
-                .or_else(|| {
-                    if Some(participant_id.as_str()) == self_sender_id.as_deref() {
-                        None
-                    } else {
-                        preferred_scoped_member_name(
-                            &participant_id,
-                            &display_names.conversation_members,
-                        )
-                    }
-                }),
-            participant_id,
-            participant_kind: None,
+        .map(|participant_id| {
+            // WeCom's own external-contact classification travels downstream so
+            // a report can keep customers and drop colleagues.
+            let participant_kind = display_names
+                .external_contacts
+                .contains(&participant_id)
+                .then(|| "external".to_owned());
+            ParticipantV1 {
+                display_name: display_names
+                    .participants
+                    .get(&participant_id)
+                    .cloned()
+                    .or_else(|| {
+                        if Some(participant_id.as_str()) == self_sender_id.as_deref() {
+                            None
+                        } else {
+                            preferred_scoped_member_name(
+                                &participant_id,
+                                &display_names.conversation_members,
+                            )
+                        }
+                    }),
+                participant_id,
+                participant_kind,
+            }
         })
         .collect::<Vec<_>>();
     let content_sha256 = hex::encode(Sha256::digest(
@@ -2516,6 +2543,11 @@ struct DisplayNameIndex {
     conversations: BTreeMap<String, String>,
     conversation_priorities: BTreeMap<String, u8>,
     conversation_members: BTreeMap<String, BTreeMap<String, String>>,
+    /// Ids WeCom itself lists as external contacts. Verified against a real
+    /// account: `external_user_ids` holds the customers and the WeCom service
+    /// accounts, and excludes both the signed-in employee and same-corp
+    /// colleagues — which is exactly the distinction a customer report needs.
+    external_contacts: BTreeSet<String>,
 }
 
 impl DisplayNameIndex {
@@ -2630,12 +2662,94 @@ fn open_snapshot_metadata_database(
     }
 }
 
+/// Columns that hold a name the operator typed for a person. Matched through
+/// `normalized_identifier`, so `remark_name`, `remarkName` and `remarkname` all
+/// resolve here.
+///
+/// `real_remarks` is the one WeCom 5.x actually writes for a customer remark
+/// (verified against `external_user_relation_v3`, keyed by the same `user_id` as
+/// `user_table.id`); it was missing from this list, which is why every name came
+/// back as a nickname.
+const REMARK_NAME_COLUMNS: &[&str] = &[
+    "real_remarks",
+    "remark_name",
+    "remark",
+    "remark_nick",
+    "remarknick",
+];
+
+/// Further remark-shaped columns. `remarks` is common enough in unrelated tables
+/// that it is only read from a table already recognised as a contact directory.
+const WEAK_REMARK_NAME_COLUMNS: &[&str] = &["corp_remark", "remarks", "recommend_remark"];
+
+/// Outranks every nickname no matter which table supplied it.
+const REMARK_NAME_PRIORITY: u8 = 200;
+/// Fallback for nickname-shaped columns found by the generic table scan.
+const GENERIC_NAME_PRIORITY: u8 = 20;
+
+/// Read WeCom's own external-contact list. A customer report keyed on this
+/// avoids mixing in the signed-in employee and same-corp colleagues, who are
+/// absent from it even though they share nicknames with real customers.
+fn collect_external_contact_ids(
+    connection: &rusqlite::Connection,
+    target: &mut BTreeSet<String>,
+) {
+    let Ok(mut statement) = connection.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    ) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+    for table in rows.filter_map(Result::ok) {
+        let normalized = normalized_identifier(&table);
+        if !normalized.contains("external")
+            || !normalized.contains("userids")
+            || normalized.contains("blacklist")
+        {
+            continue;
+        }
+        if !table_columns(connection, &table)
+            .iter()
+            .any(|column| normalized_identifier(column) == "value")
+        {
+            continue;
+        }
+        let sql = format!("SELECT value FROM {}", quote_identifier(&table));
+        let Ok(mut values) = connection.prepare(&sql) else {
+            continue;
+        };
+        // rusqlite 的 ValueRef 借用自 statement，必须在闭包内转成自有值。
+        let Ok(result) = values.query_map([], |row| Ok(sqlite_value_to_string(row.get_ref(0)?)))
+        else {
+            continue;
+        };
+        for id in result.filter_map(Result::ok) {
+            let id = id.trim();
+            if !id.is_empty() {
+                target.insert(id.to_owned());
+            }
+        }
+    }
+}
+
 fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayNameIndex) {
-    for (table, id_column, name_column, priority) in [
+    collect_external_contact_ids(connection, &mut index.external_contacts);
+    // A remark is what the operator typed for this person, so it has to outrank
+    // every nickname no matter which table it was found in. Priority used to be
+    // decided per table only, which let user_table.name win over a remark that
+    // the generic scan had already found elsewhere.
+    for (table, id_column, fallback_column, table_priority) in [
         ("user_table", "id", "name", 100),
         ("wechat_contactV1", "wxid", "name", 80),
         ("USER", "RID", "name", 90),
     ] {
+        let columns = table_columns(connection, table);
+        let (name_column, priority) = match choose_column(&columns, REMARK_NAME_COLUMNS) {
+            Some(column) => (column, REMARK_NAME_PRIORITY),
+            None => (fallback_column, table_priority),
+        };
         collect_name_rows_priority(
             connection,
             table,
@@ -2646,12 +2760,16 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
             priority,
         );
     }
+    // Scoped member names: a remark set for this chat outranks the nickname too.
+    let scoped_columns = table_columns(connection, "conversation_user_table");
+    let scoped_name_column =
+        choose_column(&scoped_columns, REMARK_NAME_COLUMNS).unwrap_or("nick_name");
     collect_conversation_member_rows(
         connection,
         "conversation_user_table",
         "conversation_id",
         "user_id",
-        "nick_name",
+        scoped_name_column,
         &mut index.conversation_members,
     );
     collect_name_rows_priority(
@@ -2676,11 +2794,14 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
     for table in tables {
         let normalized_table = normalized_identifier(&table);
         let columns = table_columns(connection, &table);
-        let name_column = choose_column(
+        // A remark column and a nickname column are read separately: a contact with
+        // no remark still needs its nickname, and the remark outranks it wherever
+        // it happens to be set.
+        let remark_column = choose_column(&columns, REMARK_NAME_COLUMNS);
+        let weak_remark_column = choose_column(&columns, WEAK_REMARK_NAME_COLUMNS);
+        let display_column = choose_column(
             &columns,
             &[
-                "remark_name",
-                "remark",
                 "display_name",
                 "displayname",
                 "nickname",
@@ -2690,7 +2811,10 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
                 "alias",
             ],
         );
-        let Some(name_column) = name_column else {
+        let Some(name_column) = remark_column
+            .or(weak_remark_column)
+            .or(display_column)
+        else {
             continue;
         };
         if normalized_table.contains("conversation")
@@ -2732,7 +2856,7 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
             );
             continue;
         }
-        if [
+        let looks_like_directory = [
             "participant",
             "contact",
             "member",
@@ -2742,7 +2866,11 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
             "buddy",
         ]
         .iter()
-        .any(|keyword| normalized_table.contains(keyword))
+        .any(|keyword| normalized_table.contains(keyword));
+        if (looks_like_directory
+            // A table carrying a remark column is worth reading whatever it is
+            // called: the remark is the name the operator actually uses.
+            || remark_column.is_some())
             && !normalized_table.contains("conversation")
         {
             for id_column in choose_identifier_columns(
@@ -2762,15 +2890,24 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
                     "id",
                 ],
             ) {
-                collect_name_rows_priority(
-                    connection,
-                    &table,
-                    id_column,
-                    name_column,
-                    &mut index.participants,
-                    &mut index.participant_priorities,
-                    20,
-                );
+                for (column, priority) in [
+                    (display_column, GENERIC_NAME_PRIORITY),
+                    (weak_remark_column, REMARK_NAME_PRIORITY),
+                    (remark_column, REMARK_NAME_PRIORITY),
+                ] {
+                    let Some(column) = column else {
+                        continue;
+                    };
+                    collect_name_rows_priority(
+                        connection,
+                        &table,
+                        id_column,
+                        column,
+                        &mut index.participants,
+                        &mut index.participant_priorities,
+                        priority,
+                    );
+                }
             }
         }
         if !["user", "member"]
@@ -3147,13 +3284,16 @@ fn is_media_message_type(raw_type: &str) -> bool {
             | "49:file"
             | "file"
             | "attachment"
+            | "34"
+            | "voice"
+            | "audio"
     )
 }
 
 fn media_locator_candidate(raw_type: &str, values: &[String]) -> Option<String> {
     let allow_plain_name = matches!(
         raw_type.trim().to_ascii_lowercase().as_str(),
-        "15" | "16" | "49" | "49:file" | "file" | "attachment"
+        "15" | "16" | "49" | "49:file" | "file" | "attachment" | "34" | "voice" | "audio"
     );
     let mut candidates = values
         .iter()
@@ -3212,6 +3352,11 @@ fn media_locator_score(value: &str, allow_plain_name: bool) -> u8 {
                 | "mp4"
                 | "mov"
                 | "dat"
+                | "silk"
+                | "amr"
+                | "aac"
+                | "ape"
+                | "m4a"
         )
     });
     if normalized.contains('/') && known_extension {
@@ -3243,6 +3388,7 @@ fn ensure_media_reference(
     let enabled = match message.message_type {
         MessageType::Image => options.include_images,
         MessageType::File => options.include_files,
+        MessageType::Audio => options.include_voice,
         _ => false,
     };
     if !enabled || !message.media.is_empty() {
@@ -3382,6 +3528,31 @@ fn resolve_media_metadata_with_options(
     if message.media.is_empty() {
         return Ok(blobs);
     }
+    // A message type whose media collection is switched off must never keep a
+    // content hash: the bytes are neither handed to the sink nor embedded in a
+    // blob, so a verified hash would point at a file that was never stored.
+    let collection_enabled = match message.message_type {
+        archive_domain::MessageType::Image => options.include_images,
+        archive_domain::MessageType::File => options.include_files,
+        archive_domain::MessageType::Audio => options.include_voice,
+        _ => false,
+    };
+    if !collection_enabled {
+        let reason = match message.message_type {
+            archive_domain::MessageType::Image => "image_collection_disabled",
+            archive_domain::MessageType::File => "file_collection_disabled",
+            archive_domain::MessageType::Audio => "voice_collection_disabled",
+            _ => "media_collection_disabled",
+        };
+        for media in &mut message.media {
+            media.content_hash = None;
+            media.size_bytes = None;
+            media.source_locator = "unavailable".into();
+            media.integrity = MediaIntegrity::Missing;
+            media.missing_reason = Some(reason.into());
+        }
+        return Ok(blobs);
+    }
     for media in &mut message.media {
         let resolved = resolver
             .resolve(&candidate.root_path, &media.source_locator)
@@ -3391,12 +3562,7 @@ fn resolve_media_metadata_with_options(
             .and_then(|path| media_store::hash_source(path).ok())
         {
             Some((hash, size)) => {
-                let should_embed = match message.message_type {
-                    archive_domain::MessageType::Image => options.include_images,
-                    archive_domain::MessageType::File => options.include_files,
-                    _ => false,
-                };
-                if should_embed && let Some(source_path) = resolved.as_deref() {
+                if let Some(source_path) = resolved.as_deref() {
                     if let Some(sink) = media_sink {
                         sink(source_path, &hash, size).map_err(|_| CommandError {
                             code: "MEDIA_STORE_FAILED",
@@ -3591,10 +3757,10 @@ pub fn run() {
             if let Ok(mut tray_app) = app_state.tray_app.lock() {
                 *tray_app = Some(app.handle().clone());
             }
-            if !hidden_mode_enabled {
-                if let Some(config) = collector_config.as_ref() {
-                    create_collector_tray(&app.handle(), config)?;
-                }
+            if !hidden_mode_enabled
+                && let Some(config) = collector_config.as_ref()
+            {
+                create_collector_tray(app.handle(), config)?;
             }
             let tray_app = app.handle().clone();
             let tray_state = app_state.clone();
@@ -3928,14 +4094,11 @@ fn collector_tray_icon() -> tauri::image::Image<'static> {
     let mut pixels = Vec::with_capacity(32 * 32 * 4);
     for y in 0..32_u32 {
         for x in 0..32_u32 {
-            let edge = x < 3 || x > 28 || y < 3 || y > 28;
-            let paper = x >= 8 && x <= 23 && y >= 6 && y <= 26;
-            let line = paper && (y == 13 || y == 17 || y == 21) && x >= 11 && x <= 21;
-            let (r, g, b, a) = if edge {
-                (22, 128, 60, 255)
-            } else if line {
-                (22, 128, 60, 255)
-            } else if paper {
+            let paper = (8..=23).contains(&x) && (6..=26).contains(&y);
+            let line = paper && (y == 13 || y == 17 || y == 21) && (11..=21).contains(&x);
+            // Edge, line and background all paint the same green; only the paper
+            // interior without a line is white.
+            let (r, g, b, a) = if paper && !line {
                 (255, 255, 255, 255)
             } else {
                 (22, 128, 60, 255)
@@ -3999,6 +4162,7 @@ fn scheduled_collect_and_upload(
     let media_options = MediaCollectionOptions {
         include_files: config.include_files,
         include_images: config.include_images,
+        include_voice: config.include_files || config.include_images,
     };
     let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
         resolve_collection_key(
@@ -4438,6 +4602,77 @@ mod tests {
         );
     }
 
+    /// A nickname sitting in a high-ranking table must not shadow the remark the
+    /// operator set. Priority used to be assigned per table rather than per
+    /// column kind, so `user_table.name` beat a remark the generic scan had
+    /// already found in another table.
+    #[test]
+    fn remark_names_outrank_nicknames_held_in_other_tables() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE user_table (id TEXT, name TEXT);
+                 INSERT INTO user_table VALUES ('peer1', '张三');
+                 INSERT INTO user_table VALUES ('peer2', '李四');
+                 CREATE TABLE contact_table (user_id TEXT, remark_name TEXT, nick_name TEXT);
+                 INSERT INTO contact_table VALUES ('peer1', '张三（客户A）', '张三');
+                 INSERT INTO contact_table VALUES ('peer2', '', '李四昵称');",
+            )
+            .unwrap();
+
+        let mut names = DisplayNameIndex::default();
+        collect_display_names(&connection, &mut names);
+
+        // The remark wins even though user_table ranks far higher.
+        assert_eq!(
+            names.participants.get("peer1").map(String::as_str),
+            Some("张三（客户A）")
+        );
+        // An empty remark is skipped, so the nickname from user_table stands.
+        assert_eq!(
+            names.participants.get("peer2").map(String::as_str),
+            Some("李四")
+        );
+    }
+
+    /// The exact shape WeCom 5.x uses, verified against a real account: the
+    /// remark lives in `external_user_relation_v3.real_remarks`, keyed by a
+    /// `user_id` that matches `user_table.id`. That column was missing from the
+    /// whitelist, so every contact came back as its nickname.
+    #[test]
+    fn resolves_remarks_from_the_real_wecom_relation_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE user_table (id TEXT, name TEXT);
+                 INSERT INTO user_table VALUES ('7881299717332511', 'ZZZFRA。');
+                 INSERT INTO user_table VALUES ('1688857240854005', '李四');
+                 CREATE TABLE external_user_relation_v3 (
+                    user_id TEXT, status TEXT, remarks TEXT, real_remarks TEXT,
+                    corp_remark TEXT, recommend_remark TEXT, remark_time TEXT
+                 );
+                 INSERT INTO external_user_relation_v3
+                    VALUES ('7881299717332511', '1', '', '我的宝', '', '', '1791460212');",
+            )
+            .unwrap();
+
+        let mut names = DisplayNameIndex::default();
+        collect_display_names(&connection, &mut names);
+
+        assert_eq!(
+            names.participants.get("7881299717332511").map(String::as_str),
+            Some("我的宝")
+        );
+        // A contact with no remark row at all keeps its nickname.
+        assert_eq!(
+            names
+                .participants
+                .get("1688857240854005")
+                .map(String::as_str),
+            Some("李四")
+        );
+    }
+
     #[test]
     fn extracts_text_from_protobuf_and_rejects_binary_noise() {
         let text = "你好，世界";
@@ -4734,6 +4969,7 @@ mod tests {
             MediaCollectionOptions {
                 include_files: true,
                 include_images: true,
+                include_voice: true,
             },
             None,
             None,
@@ -4766,6 +5002,7 @@ mod tests {
             MediaCollectionOptions {
                 include_files: true,
                 include_images: true,
+                include_voice: true,
             },
             Some(&media_sink),
             None,
@@ -4792,6 +5029,142 @@ mod tests {
             MessageType::Text
         );
         assert!(text_only.media_blobs.is_empty());
+    }
+
+    #[test]
+    fn voice_messages_keep_their_record_and_collect_audio_when_media_is_enabled() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("source");
+        let media_root = source_root.join("FileStorage");
+        let voice_root = source_root.join("Voice");
+        fs::create_dir_all(&media_root).unwrap();
+        fs::create_dir_all(&voice_root).unwrap();
+        let image_bytes = b"synthetic image bytes";
+        let voice_bytes = b"synthetic silk bytes";
+        fs::write(media_root.join("photo-fixture.png"), image_bytes).unwrap();
+        fs::write(voice_root.join("voice-fixture.silk"), voice_bytes).unwrap();
+        let message_path = source_root.join("message.db");
+        let connection = Connection::open(&message_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                    source_message_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    sender_id TEXT,
+                    sent_at_unix_ms INTEGER NOT NULL,
+                    outgoing INTEGER,
+                    raw_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    recalled INTEGER NOT NULL
+                );
+                INSERT INTO messages VALUES (
+                    'text-1', 'conversation-1', 'participant-1', 1700000000000, 0,
+                    'text', '{\"text\":\"保留的文本\"}', 0
+                );
+                INSERT INTO messages VALUES (
+                    'image-1', 'conversation-1', 'participant-1', 1700000001000, 0,
+                    'image', '{\"media_path\":\"photo-fixture.png\",\"name\":\"photo-fixture.png\"}', 0
+                );
+                INSERT INTO messages VALUES (
+                    'voice-1', 'conversation-1', 'participant-2', 1700000002000, 0,
+                    '34', '{\"media_path\":\"voice-fixture.silk\",\"name\":\"voice-fixture.silk\"}', 0
+                );",
+            )
+            .unwrap();
+        drop(connection);
+        let candidate = SourceCandidate {
+            source_id: "source".into(),
+            display_path: "source".into(),
+            root_path: source_root,
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: message_path,
+                wal_path: None,
+                shm_path: None,
+                encrypted: false,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![media_root, voice_root],
+            client_version: None,
+            capability: SourceCapability::ProbeRequired,
+        };
+
+        let collected = collect_candidate_with_options(
+            candidate.clone(),
+            directory.0.join("work-voice"),
+            None,
+            authorization(),
+            MediaCollectionOptions {
+                include_files: false,
+                include_images: true,
+                include_voice: true,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(collected.message_count, 3);
+        assert_eq!(collected.media_count, 2);
+
+        let voice_message = collected.batches[0]
+            .messages
+            .iter()
+            .find(|message| message.source_message_id == "voice-1")
+            .expect("voice message survives collection");
+        assert_eq!(voice_message.message_type, MessageType::Audio);
+        assert_eq!(voice_message.media.len(), 1);
+        let voice_media = &voice_message.media[0];
+        assert_eq!(voice_media.integrity, MediaIntegrity::Verified);
+        assert_eq!(voice_media.size_bytes, Some(voice_bytes.len() as u64));
+        assert!(voice_media.content_hash.is_some());
+        let voice_hash = voice_media.content_hash.clone().unwrap();
+        let voice_blob = collected
+            .media_blobs
+            .iter()
+            .find(|blob| blob.content_hash == voice_hash)
+            .expect("voice bytes travel with the batch");
+        assert_eq!(
+            hex::decode(&voice_blob.content_hex).unwrap(),
+            voice_bytes
+        );
+
+        // Voice collection switched off: the message itself must survive so the
+        // archive still records that a voice was sent, but it may not carry a
+        // content hash because no audio was ever written to the media store.
+        let without_voice = collect_candidate_with_options(
+            candidate,
+            directory.0.join("work-no-voice"),
+            None,
+            authorization(),
+            MediaCollectionOptions {
+                include_files: false,
+                include_images: true,
+                include_voice: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(without_voice.message_count, 3);
+        let muted_voice = without_voice.batches[0]
+            .messages
+            .iter()
+            .find(|message| message.source_message_id == "voice-1")
+            .expect("voice message still archived without audio");
+        assert_eq!(muted_voice.message_type, MessageType::Audio);
+        assert_eq!(muted_voice.media.len(), 1);
+        assert_eq!(muted_voice.media[0].integrity, MediaIntegrity::Missing);
+        assert_eq!(
+            muted_voice.media[0].missing_reason.as_deref(),
+            Some("voice_collection_disabled")
+        );
+        assert!(muted_voice.media[0].content_hash.is_none());
+        assert!(
+            without_voice
+                .media_blobs
+                .iter()
+                .all(|blob| hex::decode(&blob.content_hex).unwrap() != voice_bytes)
+        );
     }
 
     #[test]
